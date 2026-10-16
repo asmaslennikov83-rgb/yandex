@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 import time
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Keyboard, Update
+from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Keyboard, Update, WebAppInfo, MenuButtonWebApp
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from core import APIError, Availability, Yandex, capability, is_light
@@ -33,6 +33,7 @@ class Store:
         self.db.execute('CREATE TABLE IF NOT EXISTS favorites (uid INTEGER, device TEXT, PRIMARY KEY(uid,device))')
         self.db.execute('CREATE TABLE IF NOT EXISTS selected_homes (uid INTEGER PRIMARY KEY, home TEXT NOT NULL)')
         self.db.execute('CREATE TABLE IF NOT EXISTS extra_lights (device TEXT PRIMARY KEY)')
+        self.db.execute("CREATE TABLE IF NOT EXISTS appearance (uid INTEGER PRIMARY KEY, theme TEXT NOT NULL)")
         self.db.commit()
 
     def join(self, uid):
@@ -78,6 +79,20 @@ class Store:
             self.db.execute('DELETE FROM extra_lights WHERE device=?', (did,))
         self.db.commit()
 
+    def theme(self, uid):
+        row = self.db.execute('SELECT theme FROM appearance WHERE uid=?', (uid,)).fetchone()
+        return row[0] if row else 'dark'
+
+    def set_theme(self, uid, theme):
+        if theme not in ('light', 'dark', 'cozy'):
+            raise ValueError('Unknown theme')
+        self.db.execute('INSERT OR REPLACE INTO appearance VALUES (?,?)', (uid, theme))
+        self.db.commit()
+
+    def set_alerts(self, uid, enabled):
+        self.db.execute('UPDATE users SET alerts=? WHERE id=?', (int(enabled), uid))
+        self.db.commit()
+
 
 class HomeBot:
     def __init__(self, api, allowed, store, extra=(), interval=120):
@@ -92,6 +107,11 @@ class HomeBot:
         self.availability = Availability()
         self.monitor_task = None
         self.api_failed = False
+        self.web_runner = None
+        self.webapp_url = os.getenv('WEBAPP_URL', '').strip().rstrip('/')
+
+    def app_button(self):
+        return [[Button('🏠 Открыть панель', web_app=WebAppInfo(self.webapp_url))]] if self.webapp_url else []
 
     @property
     def extra(self):
@@ -185,7 +205,7 @@ class HomeBot:
         home = self.selected_home(update.effective_user.id)
         if home is None:
             return await self.homes_page(update, 0)
-        await self.show(update, '🏠 ' + self.homes[home][:180] + '\nУправление светом. Выберите раздел.', [
+        await self.show(update, '🏠 ' + self.homes[home][:180] + '\nУправление светом. Выберите раздел.', self.app_button() + [
             [Button('🏘 Выбрать дом', callback_data='homes:0')],
             [Button('💡 Весь свет', callback_data='list:all:0'), Button('🏠 Комнаты', callback_data='rooms:0')],
             [Button('⭐ Избранное', callback_data='list:fav:0')],
@@ -215,6 +235,7 @@ class HomeBot:
         rows += self.pages('homes', page, len(items))
         rows.append([Button('🔄 Обновить', callback_data='refreshhomes')])
         rows.append([Button('🔎 Диагностика', callback_data='diag:0')])
+        rows = self.app_button() + rows
         await self.show(update, '🏘 Выберите дом' if items else 'Дома не найдены в аккаунте Яндекса.', rows)
 
     async def rooms_page(self, update, page):
@@ -263,7 +284,7 @@ class HomeBot:
         home = self.selected_home(update.effective_user.id)
         total = max(1, (len(self.inventory) + 7) // 8)
         page = min(max(0, page), total - 1)
-        lines = [f'🔎 Диагностика v1.3 — страница {page+1}/{total}',
+        lines = [f'🔎 Диагностика v2.0 — страница {page+1}/{total}',
                  f'Устройства {page*8+1 if self.inventory else 0}–{min((page+1)*8, len(self.inventory))} из {len(self.inventory)}.',
                  'Выбранный дом: ' + self.homes.get(home, 'не выбран')[:100],
                  f'Всего устройств API: {len(self.inventory)}; распознано света: {len(self.devices)}.']
@@ -293,7 +314,7 @@ class HomeBot:
     def full_diagnostics(self, uid):
         home = self.selected_home(uid)
         extra = self.extra
-        lines = ['Диагностика v1.3 — полный отчёт',
+        lines = ['Диагностика v2.0 — полный отчёт',
                  'Выбранный дом: ' + self.homes.get(home, 'не выбран'),
                  f'Всего устройств API: {len(self.inventory)}; распознано света: {len(self.devices)}.']
         for hid, name in self.homes.items():
@@ -503,16 +524,25 @@ class HomeBot:
             await asyncio.sleep(self.interval)
 
     async def init(self, app):
+        from mini_app import start_web
+        self.web_runner = await start_web(self, app.bot.token, int(os.getenv('PORT', '8000')))
         await app.bot.set_my_commands([('start','Управление светом'), ('diagnostics','Диагностика устройств')])
+        if self.webapp_url:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp('🏠 Мой дом', WebAppInfo(self.webapp_url)))
         self.monitor_task = asyncio.create_task(self.monitor(app))
 
     async def stop(self, app):
+        if self.web_runner:
+            await self.web_runner.cleanup()
+            self.web_runner = None
         if self.monitor_task:
             self.monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.monitor_task
 
     async def shutdown(self, app):
+        if self.web_runner:
+            await self.web_runner.cleanup()
         await self.api.client.aclose()
         self.store.db.close()
 
@@ -540,6 +570,12 @@ def main():
     except (KeyError, ValueError):
         raise SystemExit('Заполните TELEGRAM_BOT_TOKEN, YANDEX_OAUTH_TOKEN, ALLOWED_USER_IDS. POLL_SECONDS >= 60.')
     extra = {x.strip() for x in os.getenv('EXTRA_LIGHT_IDS','').split(',') if x.strip()}
+    from urllib.parse import urlsplit
+    web_url = os.getenv('WEBAPP_URL', '').strip()
+    if web_url:
+        url = urlsplit(web_url)
+        if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('', '/'):
+            raise SystemExit('WEBAPP_URL должен быть HTTPS-адресом домена, без пути и параметров.')
     service = HomeBot(Yandex(ytoken), allowed, Store(Path(os.getenv('DATA_DIR','data'))/'bot.sqlite3'), extra, interval)
     app = (Application.builder().token(token).post_init(service.init).post_stop(service.stop)
            .post_shutdown(service.shutdown).build())
