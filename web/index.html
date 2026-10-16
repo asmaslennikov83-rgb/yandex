@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark"><title>Мой умный дом</title>
+<link rel="stylesheet" href="/style.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script defer src="/app.js"></script>
+</head>
+<body>
+<main id="app" aria-busy="true">
+<header class="top"><div class="brand-mark" aria-hidden="true">⌂</div><div><p class="eyebrow">ВСЁ ПОД КОНТРОЛЕМ</p><h1>Мой умный дом</h1></div><button id="refresh" class="icon-button" aria-label="Обновить устройства">↻</button></header>
+<div id="homes" class="homes" aria-label="Выбор дома"></div>
+<section id="content"><div class="loading"><div class="spinner"></div><h2>Подключаемся к дому</h2><p>Получаем ваши устройства</p></div></section>
+<footer class="sync" id="sync"></footer>
+</main>
+<nav id="nav" class="nav" aria-label="Основные разделы" hidden>
+<button data-tab="home" class="active"><span aria-hidden="true">⌂</span>Главная</button>
+<button data-tab="rooms"><span aria-hidden="true">▦</span>Комнаты</button>
+<button data-tab="settings"><span aria-hidden="true">⚙</span>Настройки</button>
+</nav>
+<div id="toast" role="status" aria-live="polite"></div>
+<dialog id="details"><button id="close-dialog" class="icon-button close" aria-label="Закрыть">×</button><div id="detail-content"></div></dialog>
+</body></html>
