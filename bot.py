@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import hashlib
+import io
 import logging
 import os
 from pathlib import Path
@@ -31,6 +32,7 @@ class Store:
         self.db.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, alerts INTEGER NOT NULL DEFAULT 1)')
         self.db.execute('CREATE TABLE IF NOT EXISTS favorites (uid INTEGER, device TEXT, PRIMARY KEY(uid,device))')
         self.db.execute('CREATE TABLE IF NOT EXISTS selected_homes (uid INTEGER PRIMARY KEY, home TEXT NOT NULL)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS extra_lights (device TEXT PRIMARY KEY)')
         self.db.commit()
 
     def join(self, uid):
@@ -66,11 +68,21 @@ class Store:
         self.db.execute('INSERT OR REPLACE INTO selected_homes VALUES (?,?)', (uid, home))
         self.db.commit()
 
+    def extra_lights(self):
+        return {r[0] for r in self.db.execute('SELECT device FROM extra_lights')}
+
+    def set_extra_light(self, did, enabled):
+        if enabled:
+            self.db.execute('INSERT OR IGNORE INTO extra_lights VALUES (?)', (did,))
+        else:
+            self.db.execute('DELETE FROM extra_lights WHERE device=?', (did,))
+        self.db.commit()
+
 
 class HomeBot:
     def __init__(self, api, allowed, store, extra=(), interval=120):
         self.api, self.allowed, self.store = api, allowed, store
-        self.extra, self.interval = extra, interval
+        self.env_extra, self.interval = set(extra), interval
         self.devices, self.rooms = {}, {}
         self.homes, self.room_homes = {}, {}
         self.inventory = []
@@ -80,6 +92,22 @@ class HomeBot:
         self.availability = Availability()
         self.monitor_task = None
         self.api_failed = False
+
+    @property
+    def extra(self):
+        return self.env_extra | self.store.extra_lights()
+
+    @staticmethod
+    def light_candidate(d):
+        kind = d.get('type', '')
+        return any(kind == base or kind.startswith(base + '.') for base in
+                   ('devices.types.socket', 'devices.types.switch')) and capability(d, 'on_off') is not None
+
+    def rebuild_lights(self):
+        extra = self.extra
+        self.devices = {key(d['id']): d for d in self.inventory if is_light(d, extra)}
+        for d in self.devices.values():
+            self.homes.setdefault(d['household_id'], 'Без привязки к дому' if d['household_id'] == '__unassigned__' else 'Дом')
 
     async def refresh(self, force=False):
         async with self.refresh_lock:
@@ -161,6 +189,7 @@ class HomeBot:
             [Button('🏘 Выбрать дом', callback_data='homes:0')],
             [Button('💡 Весь свет', callback_data='list:all:0'), Button('🏠 Комнаты', callback_data='rooms:0')],
             [Button('⭐ Избранное', callback_data='list:fav:0')],
+            [Button('➕ Добавить устройство в свет', callback_data='extras:0')],
             [Button('🔔 Уведомления', callback_data='alerts')],
             [Button('🔎 Диагностика', callback_data='diag:0')],
             [Button('🔄 Обновить список', callback_data='refresh')]])
@@ -219,6 +248,7 @@ class HomeBot:
         rows += self.pages('list:'+scope, page, len(items))
         if not items:
             rows.append([Button('🏘 Выбрать дом', callback_data='homes:0'), Button('🔎 Диагностика', callback_data='diag:0')])
+            rows.append([Button('➕ Добавить устройство в свет', callback_data='extras:0')])
         rows.append([Button('⬅️ Главное меню', callback_data='home')])
         home = self.selected_home(update.effective_user.id)
         message = f'🏠 {self.homes.get(home, "Дом")[:180]}\n💡 Свет — {len(items)} устройств\nВыберите устройство.'
@@ -229,9 +259,13 @@ class HomeBot:
                 'Если цифры не совпадают с приложением, откройте «Диагностика».')
         await self.show(update, message, rows)
 
-    async def diagnostics(self, update, page):
+    async def diagnostics(self, update, page, send=False):
         home = self.selected_home(update.effective_user.id)
-        lines = ['🔎 Диагностика v1.2', 'Выбранный дом: ' + self.homes.get(home, 'не выбран')[:100],
+        total = max(1, (len(self.inventory) + 7) // 8)
+        page = min(max(0, page), total - 1)
+        lines = [f'🔎 Диагностика v1.3 — страница {page+1}/{total}',
+                 f'Устройства {page*8+1 if self.inventory else 0}–{min((page+1)*8, len(self.inventory))} из {len(self.inventory)}.',
+                 'Выбранный дом: ' + self.homes.get(home, 'не выбран')[:100],
                  f'Всего устройств API: {len(self.inventory)}; распознано света: {len(self.devices)}.']
         for hid, name in list(self.homes.items())[:15]:
             count = sum(d.get('household_id') == hid for d in self.devices.values())
@@ -251,7 +285,57 @@ class HomeBot:
         if (page+1)*8 < len(self.inventory):
             rows.append([Button('➡️', callback_data=f'diag:{page+1}')])
         rows += [[Button('🔄 Обновить', callback_data='refreshdiag')], [Button('⬅️ Меню', callback_data='home')]]
+        rows.insert(0, [Button('📋 Скопировать всё', callback_data='diagall')])
+        if send:
+            return await update.effective_message.reply_text('\n'.join(lines)[:4000])
         await self.show(update, '\n'.join(lines), rows)
+
+    def full_diagnostics(self, uid):
+        home = self.selected_home(uid)
+        extra = self.extra
+        lines = ['Диагностика v1.3 — полный отчёт',
+                 'Выбранный дом: ' + self.homes.get(home, 'не выбран'),
+                 f'Всего устройств API: {len(self.inventory)}; распознано света: {len(self.devices)}.']
+        for hid, name in self.homes.items():
+            count = sum(d.get('household_id') == hid for d in self.devices.values())
+            lines.append(f'Дом {name}: {count} свет.')
+        for i, d in enumerate(self.inventory, 1):
+            lines.extend(['', f'{i}. {d.get("name", "Устройство")} [{key(d["id"])}]',
+                'Тип: ' + str(d.get('type', 'не задан')),
+                'Дом: ' + self.homes.get(d.get('household_id'), 'Без привязки к дому') +
+                '; связь: ' + self.home_sources.get(d['id'], 'неизвестно'),
+                'Свет: да' if is_light(d, extra) else 'Свет: нет'])
+        return '\n'.join(lines)
+
+    async def extras_page(self, update, page):
+        candidates = sorted((d for d in self.inventory if self.light_candidate(d) and
+            self.in_selected_home(update.effective_user.id, d)), key=lambda d: d.get('name', ''))
+        extra = self.extra
+        rows = [[Button(('✅ ' if d['id'] in extra else '➕ ') + d.get('name', 'Устройство')[:50],
+                        callback_data='extraedit:' + key(d['id']))] for d in candidates[page*10:(page+1)*10]]
+        rows += self.pages('extras', page, len(candidates))
+        rows.append([Button('⬅️ Главное меню', callback_data='home')])
+        home = self.selected_home(update.effective_user.id)
+        await self.show(update, '🏠 ' + self.homes.get(home, 'Дом')[:100] +
+            '\nРозетки и выключатели: выберите те, к которым подключён свет.\n' +
+            ('Выбор общий для всех пользователей. Добавление в список не включает устройство.' if candidates else
+             'В этом доме API не вернул розеток или выключателей с функцией включения.'), rows)
+
+    async def edit_extra(self, update, k):
+        d = next((d for d in self.inventory if key(d['id']) == k), None)
+        if not d or not self.light_candidate(d) or not self.in_selected_home(update.effective_user.id, d):
+            raise APIError('Устройство недоступно в выбранном доме. Откройте список заново.')
+        added = d['id'] in self.extra
+        rows = []
+        if d['id'] in self.env_extra:
+            description = 'Добавлено через EXTRA_LIGHT_IDS. Удаление — через переменные хостинга.'
+        else:
+            description = 'Уже показывается как свет.' if added else 'Добавить это устройство в раздел света?'
+            rows.append([Button('Убрать из света' if added else 'Добавить в свет',
+                                callback_data=f'extraset:{k}:{0 if added else 1}')])
+        rows.append([Button('⬅️ К списку', callback_data='extras:0')])
+        await self.show(update, '💡 ' + d.get('name', 'Устройство')[:120] + '\n' + description +
+                        '\nЭто меняет только список бота, без команды устройству.', rows)
 
     async def diagnostics_command(self, update, context):
         if not await self.guard(update):
@@ -321,6 +405,11 @@ class HomeBot:
             await self.refresh(force=cmd in ('refresh', 'refreshhomes', 'refreshdiag'))
             if cmd in ('diag', 'refreshdiag'):
                 return await self.diagnostics(update, max(0, int(parts[1])) if cmd == 'diag' else 0)
+            if cmd == 'diagall':
+                report = io.BytesIO(self.full_diagnostics(update.effective_user.id).encode('utf-8'))
+                await update.effective_message.reply_document(document=report, filename='diagnostics_all.txt',
+                    caption='Полная диагностика всех устройств. Перешлите этот файл или откройте его → Выделить всё → Скопировать.')
+                return
             if cmd in ('homes', 'refreshhomes'):
                 return await self.homes_page(update, max(0, int(parts[1])) if cmd == 'homes' else 0)
             if cmd == 'choosehome':
@@ -331,6 +420,21 @@ class HomeBot:
                 return await self.menu(update, context)
             if self.selected_home(update.effective_user.id) is None:
                 return await self.homes_page(update, 0)
+            if cmd == 'extras':
+                return await self.extras_page(update, max(0, int(parts[1])))
+            if cmd in ('extraedit', 'extraset'):
+                k = parts[1]
+                if cmd == 'extraset':
+                    d = next((d for d in self.inventory if key(d['id']) == k), None)
+                    if not d or not self.light_candidate(d) or not self.in_selected_home(update.effective_user.id, d):
+                        raise APIError('Устройство недоступно в выбранном доме. Откройте список заново.')
+                    if d['id'] in self.env_extra:
+                        raise APIError('Устройство задано в EXTRA_LIGHT_IDS: измените переменную на хостинге.')
+                    if parts[2] not in ('0', '1'):
+                        raise APIError('Некорректная команда.')
+                    self.store.set_extra_light(d['id'], parts[2] == '1')
+                    self.rebuild_lights()
+                return await self.edit_extra(update, k)
             if cmd == 'refresh':
                 count = sum(self.in_selected_home(update.effective_user.id, d) for d in self.devices.values())
                 return await self.show(update, f'Список обновлён. Устройств света в выбранном доме: {count}', [[Button('💡 Свет', callback_data='list:all:0')], [Button('⬅️ Меню', callback_data='home')]])
