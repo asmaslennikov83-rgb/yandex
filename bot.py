@@ -73,6 +73,8 @@ class HomeBot:
         self.extra, self.interval = extra, interval
         self.devices, self.rooms = {}, {}
         self.homes, self.room_homes = {}, {}
+        self.inventory = []
+        self.home_sources = {}
         self.refresh_lock = asyncio.Lock()
         self.refreshed = 0
         self.availability = Availability()
@@ -84,13 +86,40 @@ class HomeBot:
             if not force and time.monotonic() - self.refreshed < 30:
                 return
             info = await self.api.info()
-            self.devices = {key(d['id']): d for d in info.get('devices', []) if is_light(d, self.extra)}
             homes = {h['id']: h['name'] for h in info.get('households', [])}
             self.room_homes = {r['id']: r.get('household_id') for r in info.get('rooms', [])}
-            # Normalize membership once from the full inventory. Device detail
-            # responses may omit household_id, so preserve inventory metadata.
+            room_members = {}
+            device_rooms = {}
+            group_members = {}
+            for room in info.get('rooms', []):
+                if room.get('household_id'):
+                    for did in room.get('devices', []):
+                        room_members.setdefault(did, set()).add(room['household_id'])
+                        device_rooms.setdefault(did, set()).add(room['id'])
+            for group in info.get('groups', []):
+                if group.get('household_id'):
+                    for did in group.get('devices', []):
+                        group_members.setdefault(did, set()).add(group['household_id'])
+            inventory, sources = [], {}
+            for raw in info.get('devices', []):
+                d = dict(raw)
+                if not d.get('room') and len(device_rooms.get(d['id'], set())) == 1:
+                    d['room'] = next(iter(device_rooms[d['id']]))
+                home = d.get('household_id') or self.room_homes.get(d.get('room'))
+                source = 'устройство' if d.get('household_id') else 'комната'
+                if not home:
+                    candidates = room_members.get(d['id'], set()) | group_members.get(d['id'], set())
+                    if len(candidates) == 1:
+                        home = next(iter(candidates))
+                        source = 'списки комнат/групп'
+                    else:
+                        source = 'не определён' if not candidates else 'противоречивые связи'
+                d['household_id'] = home or '__unassigned__'
+                sources[d['id']] = source
+                inventory.append(d)
+            self.inventory, self.home_sources = inventory, sources
+            self.devices = {key(d['id']): d for d in inventory if is_light(d, self.extra)}
             for d in self.devices.values():
-                d['household_id'] = d.get('household_id') or self.room_homes.get(d.get('room')) or '__unassigned__'
                 homes.setdefault(d['household_id'], 'Без привязки к дому' if d['household_id'] == '__unassigned__' else 'Дом')
             self.homes = homes
             self.rooms = {key(r['id']): (r['id'], homes.get(r.get('household_id'), 'Дом') + ' / ' + r['name'])
@@ -133,6 +162,7 @@ class HomeBot:
             [Button('💡 Весь свет', callback_data='list:all:0'), Button('🏠 Комнаты', callback_data='rooms:0')],
             [Button('⭐ Избранное', callback_data='list:fav:0')],
             [Button('🔔 Уведомления', callback_data='alerts')],
+            [Button('🔎 Диагностика', callback_data='diag:0')],
             [Button('🔄 Обновить список', callback_data='refresh')]])
 
     def selected_home(self, uid):
@@ -151,10 +181,11 @@ class HomeBot:
 
     async def homes_page(self, update, page):
         items = sorted(self.homes.items(), key=lambda x: (x[1], x[0]))
-        rows = [[Button(name[:60], callback_data='choosehome:' + key(hid))]
+        rows = [[Button(name[:48] + ' — ' + str(sum(d.get('household_id') == hid for d in self.devices.values())) + ' 💡', callback_data='choosehome:' + key(hid))]
                 for hid, name in items[page*10:(page+1)*10]]
         rows += self.pages('homes', page, len(items))
         rows.append([Button('🔄 Обновить', callback_data='refreshhomes')])
+        rows.append([Button('🔎 Диагностика', callback_data='diag:0')])
         await self.show(update, '🏘 Выберите дом' if items else 'Дома не найдены в аккаунте Яндекса.', rows)
 
     async def rooms_page(self, update, page):
@@ -186,9 +217,50 @@ class HomeBot:
             or (scope not in ('all', 'fav') and d.get('room') == room))), key=lambda x: x[1]['name'])
         rows = [[Button(d['name'][:60], callback_data='device:'+k)] for k,d in items[page*10:(page+1)*10]]
         rows += self.pages('list:'+scope, page, len(items))
+        if not items:
+            rows.append([Button('🏘 Выбрать дом', callback_data='homes:0'), Button('🔎 Диагностика', callback_data='diag:0')])
         rows.append([Button('⬅️ Главное меню', callback_data='home')])
-        await self.show(update, f'💡 Свет — {len(items)} устройств\nВыберите устройство.' if items else
-            'Свет не найден. Проверьте устройства в «Доме с Алисой».\nДля выключателей света предусмотрена настройка EXTRA_LIGHT_IDS.', rows)
+        home = self.selected_home(update.effective_user.id)
+        message = f'🏠 {self.homes.get(home, "Дом")[:180]}\n💡 Свет — {len(items)} устройств\nВыберите устройство.'
+        if not items:
+            message = ('В выбранном разделе нет света.\n' +
+                f'Распознано света во всём аккаунте: {len(self.devices)}.\n' +
+                'Откройте «Выбрать дом»: возле каждого дома указано число ламп.\n' +
+                'Если цифры не совпадают с приложением, откройте «Диагностика».')
+        await self.show(update, message, rows)
+
+    async def diagnostics(self, update, page):
+        home = self.selected_home(update.effective_user.id)
+        lines = ['🔎 Диагностика v1.2', 'Выбранный дом: ' + self.homes.get(home, 'не выбран')[:100],
+                 f'Всего устройств API: {len(self.inventory)}; распознано света: {len(self.devices)}.']
+        for hid, name in list(self.homes.items())[:15]:
+            count = sum(d.get('household_id') == hid for d in self.devices.values())
+            lines.append(f'Дом {name[:60]}: {count} свет.')
+        rows = []
+        items = self.inventory[page*8:(page+1)*8]
+        for d in items:
+            label = self.homes.get(d.get('household_id'), 'Без привязки к дому')
+            lines.append('\n' + d.get('name', 'Устройство')[:60] + ' [' + key(d['id']) + ']\n' +
+                'Тип: ' + str(d.get('type', 'не задан'))[:80] + '\n' +
+                'Дом: ' + label[:60] + '; связь: ' + self.home_sources.get(d['id'], 'неизвестно') + '\n' +
+                ('Свет: да' if is_light(d, self.extra) else 'Свет: нет'))
+        # Diagnostics deliberately contains only these whitelisted fields,
+        # never the raw API payload, OAuth token, account ID or headers.
+        if page:
+            rows.append([Button('⬅️', callback_data=f'diag:{page-1}')])
+        if (page+1)*8 < len(self.inventory):
+            rows.append([Button('➡️', callback_data=f'diag:{page+1}')])
+        rows += [[Button('🔄 Обновить', callback_data='refreshdiag')], [Button('⬅️ Меню', callback_data='home')]]
+        await self.show(update, '\n'.join(lines), rows)
+
+    async def diagnostics_command(self, update, context):
+        if not await self.guard(update):
+            return
+        try:
+            await self.refresh(force=True)
+            await self.diagnostics(update, 0)
+        except APIError as e:
+            await self.show(update, '⚠️ ' + str(e), [[Button('Повторить', callback_data='refreshdiag')]])
 
     async def panel(self, update, k, prefix=''):
         if not self.in_selected_home(update.effective_user.id, self.devices[k]):
@@ -246,7 +318,9 @@ class HomeBot:
                 self.store.toggle(update.effective_user.id)
                 return await self.show(update, 'Уведомления ' + ('включены.' if self.store.enabled(update.effective_user.id) else 'выключены.'),
                     [[Button('⬅️ Меню', callback_data='home')]])
-            await self.refresh(force=cmd in ('refresh', 'refreshhomes'))
+            await self.refresh(force=cmd in ('refresh', 'refreshhomes', 'refreshdiag'))
+            if cmd in ('diag', 'refreshdiag'):
+                return await self.diagnostics(update, max(0, int(parts[1])) if cmd == 'diag' else 0)
             if cmd in ('homes', 'refreshhomes'):
                 return await self.homes_page(update, max(0, int(parts[1])) if cmd == 'homes' else 0)
             if cmd == 'choosehome':
@@ -325,7 +399,7 @@ class HomeBot:
             await asyncio.sleep(self.interval)
 
     async def init(self, app):
-        await app.bot.set_my_commands([('start','Управление светом')])
+        await app.bot.set_my_commands([('start','Управление светом'), ('diagnostics','Диагностика устройств')])
         self.monitor_task = asyncio.create_task(self.monitor(app))
 
     async def stop(self, app):
@@ -366,6 +440,7 @@ def main():
     app = (Application.builder().token(token).post_init(service.init).post_stop(service.stop)
            .post_shutdown(service.shutdown).build())
     app.add_handler(CommandHandler('start', service.menu))
+    app.add_handler(CommandHandler('diagnostics', service.diagnostics_command))
     app.add_handler(CallbackQueryHandler(service.callback))
     app.add_error_handler(error_handler)
     app.run_polling(allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY], drop_pending_updates=True)
